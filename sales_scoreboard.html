@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Editable Sales Scoreboard</title>
+<style>
+  :root{--bg:#fff;--ink:#111;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;}
+  body{font-family:Segoe UI,Arial,sans-serif;margin:20px;color:var(--ink);background:var(--bg)}
+  h1{font-size:20px;margin:0 0 6px}
+  .subtitle{color:var(--muted);margin-bottom:14px}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  .btn{padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:#fafafa;cursor:pointer}
+  .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .sheet{margin:18px 0}
+  table{width:100%;border-collapse:collapse;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  thead th{background:#fbfdff;padding:10px;text-align:left;border-bottom:1px solid var(--line);font-weight:600;position:sticky;top:0}
+  tbody td{padding:10px;border-bottom:1px solid var(--line)}
+  tbody tr.changed{background: #fff7ef}
+  td[contenteditable="true"]{outline: none;min-width:40px}
+  .toolbar{display:flex;gap:8px;align-items:center;margin-bottom:6px}
+  .small{font-size:13px;color:var(--muted)}
+  .status{font-size:13px;color:var(--muted);margin-left:8px}
+  .danger{color:#b91c1c}
+</style>
+</head>
+<body>
+
+<h1>Editable Sales Scoreboard</h1>
+<div class="subtitle">Click a cell to edit. Use the buttons to download CSV or sync to SharePoint.</div>
+
+<!-- Page-level controls -->
+<div class="controls">
+  <button id="makeEditable" class="btn">Make all sheets editable</button>
+  <button id="saveAllCSV" class="btn">Download all sheets as CSV (zip)</button>
+  <button id="syncAll" class="btn primary">Sync all changed rows to SharePoint</button>
+  <span id="globalStatus" class="status"></span>
+</div>
+
+<!--
+  IMPORTANT:
+  - This HTML expects tables already present in the DOM (like the sales_scoreboard.html you generated).
+  - If tables are not present, sample demo table below will be used.
+-->
+
+<!-- If you already have tables created from Excel, they will appear here.
+     For demonstration, we include a sample table (remove if not needed). -->
+
+<section class="sheet" id="sheet_demo">
+  <h2>Demo — Sales Scoreboard (sample)</h2>
+  <div class="toolbar">
+    <button class="btn" data-download="sheet_demo">Download CSV</button>
+    <button class="btn" data-sync="sheet_demo">Sync to SharePoint</button>
+    <span class="small">Edited rows: <span class="small" id="count_sheet_demo">0</span></span>
+  </div>
+
+  <table id="table_sheet_demo" data-sheet-name="SalesScoreboard">
+    <thead>
+      <tr>
+        <th onclick="sortTable('table_sheet_demo',0)">ID</th>
+        <th onclick="sortTable('table_sheet_demo',1)">Name</th>
+        <th onclick="sortTable('table_sheet_demo',2)">Region</th>
+        <th onclick="sortTable('table_sheet_demo',3)">Performance</th>
+        <th onclick="sortTable('table_sheet_demo',4)">Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>1</td><td>Shakthi</td><td>East</td><td>0</td><td></td></tr>
+      <tr><td>2</td> <td>Ravi</td>  <td>West</td> <td>5</td> <td>Good</td></tr>
+      <tr><td>3</td> <td>Meena</td>  <td>North</td><td>8</td> <td></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<script>
+/*
+  Editable HTML scoreboard script
+  - Makes table cells editable
+  - Tracks changed rows (adds CSS class .changed)
+  - Export CSV (per-sheet and all sheets as separate downloads)
+  - Template function to sync changed rows to SharePoint List via REST API
+    -- You MUST supply a BEARER_TOKEN and change SITE_URL & LIST_NAME mapping
+*/
+
+// -------------------- Utilities --------------------
+function qsAll(sel, root=document){ return Array.from(root.querySelectorAll(sel)); }
+function qs(sel, root=document){ return root.querySelector(sel); }
+
+function csvEscape(val){
+  if (val == null) return '';
+  const str = String(val).replace(/\r/g,'').replace(/\n/g,' ');
+  if (/["\n,]/.test(str)) return '"' + str.replace(/"/g,'""') + '"';
+  return str;
+}
+
+function tableToCSV(table){
+  const rows = [];
+  // headers
+  const headers = Array.from(table.tHead.rows[0].cells).map(h=>h.innerText.trim());
+  rows.push(headers.map(csvEscape).join(','));
+  // body
+  Array.from(table.tBodies[0].rows).forEach(tr=>{
+    const cells = Array.from(tr.cells).map(td=>csvEscape(td.innerText.trim()));
+    rows.push(cells.join(','));
+  });
+  return rows.join('\r\n');
+}
+
+function downloadFile(filename, content, mime='text/csv'){
+  const blob = new Blob([content], {type: mime});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; document.body.appendChild(a);
+  a.click(); a.remove(); URL.revokeObjectURL(url);
+}
+
+// -------------------- Editing & tracking --------------------
+function makeEditableForTable(table){
+  const tbody = table.tBodies[0];
+  if (!tbody) return;
+  Array.from(tbody.rows).forEach(tr=>{
+    Array.from(tr.cells).forEach(td=>{
+      // We typically don't make ID or header columns editable; let user decide.
+      // By default make all editable except if the cell text is empty and the header says ID
+      td.setAttribute('contenteditable','true');
+      td.addEventListener('input', ()=> {
+        tr.classList.add('changed');
+        updateCountForTable(table);
+      });
+      // mark blur to compress whitespace
+      td.addEventListener('blur', ()=> {
+        td.innerText = td.innerText.trim();
+      });
+    });
+  });
+  updateCountForTable(table);
+}
+
+function updateCountForTable(table){
+  const sheetId = table.id.replace('table_','table_'); // identity
+  const parent = table.closest('.sheet');
+  if (!parent) return;
+  const countSpan = parent.querySelector('[id^="count_"], .small');
+  const changed = table.tBodies[0] ? table.tBodies[0].querySelectorAll('tr.changed').length : 0;
+  // try specific ID first
+  const specific = parent.querySelector('[id^="count_"]');
+  if(specific) specific.innerText = changed;
+  else if(countSpan) countSpan.innerText = changed;
+}
+
+// -------------------- Sort (simple) --------------------
+function sortTable(tableId, colIndex){
+  const table = document.getElementById(tableId);
+  if (!table) return;
+  const dirAttr = table.getAttribute('data-sortdir') || 'asc';
+  const newDir = dirAttr === 'asc' ? 'desc' : 'asc';
+  const rows = Array.from(table.tBodies[0].rows);
+  rows.sort((a,b) => {
+    const A = a.cells[colIndex].innerText.trim();
+    const B = b.cells[colIndex].innerText.trim();
+    const nA = parseFloat(A.replace(/,/g,'')), nB = parseFloat(B.replace(/,/g,''));
+    const aIsNum = !isNaN(nA) && A !== '';
+    const bIsNum = !isNaN(nB) && B !== '';
+    let cmp = 0;
+    if (aIsNum && bIsNum) cmp = nA - nB;
+    else cmp = A.localeCompare(B, undefined, {numeric:true, sensitivity:'base'});
+    return newDir === 'asc' ? cmp : -cmp;
+  });
+  const tbody = table.tBodies[0];
+  rows.forEach(r=>tbody.appendChild(r));
+  table.setAttribute('data-sortdir', newDir);
+}
+
+// -------------------- CSV & bulk download --------------------
+function downloadCSVForTable(table){
+  const sheetName = table.getAttribute('data-sheet-name') || table.id;
+  const csv = tableToCSV(table);
+  downloadFile(${sheetName}.csv, csv);
+}
+
+// Bulk: download all sheets individually (not zipped; each triggers download)
+function downloadAllCSV(){
+  const tables = qsAll('table[id^="table_"]');
+  if (!tables.length) { alert('No tables found on page'); return; }
+  tables.forEach(t => downloadCSVForTable(t));
+}
+
+// -------------------- SharePoint sync (TEMPLATE) --------------------
+/*
+  WARNING: The SharePoint sync below is a template and requires:
+   - A valid OAuth access token with permission to write to the target list.
+   - Correct mapping of table columns -> SharePoint list column internal names.
+   - NOTE: Do not store long-lived tokens in client-side code for production.
+*/
+
+/*
+  CONFIGURE these variables before using sync:
+  - SITE_URL: your site root, e.g., "https://contoso.sharepoint.com/sites/TeamSite"
+  - LIST_NAME: the target SharePoint list display name
+  - BEARER_TOKEN: OAuth 2.0 access token. (Obtain via Azure AD & delegated flow or ask your admin)
+  - ID_COLUMN: the table column (header) used as unique identifier (if present). If you have SharePoint List ID,
+    you can update items; otherwise POST to create new items.
+  - COLUMN_MAP: an object mapping table header -> SharePoint field internal name
+*/
+
+const SP_CONFIG = {
+  SITE_URL: "https://yourtenant.sharepoint.com/sites/YourSite", // CHANGE
+  LIST_NAME: "SalesScoreboard", // CHANGE
+  BEARER_TOKEN: "BEARER_TOKEN_GOES_HERE", // CHANGE
+  ID_COLUMN: "ID", // header name in table that maps to SharePoint ID (optional)
+  // Example: table column "Performance" maps to SharePoint field "Performance" (internal name).
+  COLUMN_MAP: {
+    "ID": "ID",
+    "Name": "Title",          // Title is default required text field in SharePoint lists
+    "Region": "Region",
+    "Performance": "Performance",
+    "Notes": "Notes"
+  }
+};
+
+async function syncTableToSharePoint(table){
+  // Basic validations
+  if (SP_CONFIG.BEARER_TOKEN === "BEARER_TOKEN_GOES_HERE") {
+    alert('Please set SP_CONFIG.BEARER_TOKEN with a valid OAuth token before syncing.');
+    return { success: false, message: 'missing token' };
+  }
+  const changedRows = Array.from(table.tBodies[0].querySelectorAll('tr.changed'));
+  if (!changedRows.length) {
+    return { success: true, message: 'no changes' };
+  }
+
+  const listApiBase = ${SP_CONFIG.SITE_URL}/_api/web/lists/getbytitle('${encodeURIComponent(SP_CONFIG.LIST_NAME)}');
+  const headers = {
+    "Authorization": "Bearer " + SP_CONFIG.BEARER_TOKEN,
+    "Accept": "application/json;odata=verbose",
+    "Content-Type": "application/json;odata=verbose"
+  };
+
+  // Get list item type metadata (for X-RequestDigest not needed for REST with Bearer token)
+  async function getItemType(){
+    const url = listApiBase + "/ListItemEntityTypeFullName";
+    const r = await fetch(url, {method:'GET', headers: headers});
+    const j = await r.json();
+    return j?.d?.ListItemEntityTypeFullName;
+  }
+
+  const itemType = await getItemType();
+
+  const headersRow = Array.from(table.tHead.rows[0].cells).map(c => c.innerText.trim());
+
+  // Helper: build payload mapping table headers to field internal names
+  function buildPayloadFromRow(row){
+    const cells = Array.from(row.cells).map(td => td.innerText.trim());
+    const payload = { "__metadata": { "type": itemType } };
+    headersRow.forEach((h, i) => {
+      const spField = SP_CONFIG.COLUMN_MAP[h];
+      if (!spField) return; // unmapped column
+      payload[spField] = cells[i];
+    });
+    return payload;
+  }
+
+  // For each changed row: if ID column exists and maps to SharePoint ID -> UPDATE, else CREATE (POST)
+  const results = [];
+  for (const row of changedRows){
+    try {
+      const payload = buildPayloadFromRow(row);
+      const idColIndex = headersRow.indexOf(SP_CONFIG.ID_COLUMN);
+      let responseData = null;
+
+      if (idColIndex >= 0){
+        const idVal = row.cells[idColIndex].innerText.trim();
+        const numericId = Number(idVal);
+        if (!isNaN(numericId) && numericId > 0){
+          // Update existing item
+          const updateUrl = ${listApiBase}/items(${numericId});
+          const updateHeaders = Object.assign({}, headers, {
+            "IF-MATCH": "*",
+            "X-HTTP-Method": "MERGE"
+          });
+          const r = await fetch(updateUrl, { method: 'POST', headers: updateHeaders, body: JSON.stringify(payload) });
+          if (!r.ok) throw new Error(Update failed: ${r.status});
+          responseData = { action: 'updated', id: numericId };
+          results.push(responseData);
+          continue;
+        }
+      }
+
+      // Otherwise Create item
+      const createUrl = ${listApiBase}/items;
+      const r2 = await fetch(createUrl, { method: 'POST', headers: headers, body: JSON.stringify(payload) });
+      if (!r2.ok) throw new Error(Create failed: ${r2.status});
+      const j2 = await r2.json();
+      responseData = { action: 'created', id: j2?.d?.Id || null };
+      results.push(responseData);
+
+    } catch (err){
+      results.push({ action: 'error', message: err.message });
+    }
+  }
+
+  // If success, remove changed marking
+  // (Optionally: update ID column in table with created IDs — left as exercise)
+  changedRows.forEach(r => r.classList.remove('changed'));
+  updateCountForTable(table);
+
+  return { success: true, results: results };
+}
+
+// -------------------- DOM: hook buttons & wire actions --------------------
+document.getElementById('makeEditable').addEventListener('click', ()=>{
+  qsAll('table[id^="table_"]').forEach(t => makeEditableForTable(t));
+  document.getElementById('globalStatus').innerText = "All tables are now editable";
+});
+
+qsAll('.btn[data-download]').forEach(btn=>{
+  btn.addEventListener('click', e=>{
+    const parent = btn.closest('.sheet');
+    const table = parent.querySelector('table[id^="table_"]');
+    if (table) downloadCSVForTable(table);
+  });
+});
+
+qsAll('.btn[data-sync]').forEach(btn=>{
+  btn.addEventListener('click', async e=>{
+    const parent = btn.closest('.sheet');
+    const table = parent.querySelector('table[id^="table_"]');
+    if (!table) return alert('table not found');
+    document.getElementById('globalStatus').innerText = 'Syncing...';
+    try{
+      const res = await syncTableToSharePoint(table);
+      document.getElementById('globalStatus').innerText = 'Sync complete: ' + JSON.stringify(res.results || res);
+    }catch(err){
+      document.getElementById('globalStatus').innerText = 'Sync failed: ' + err.message;
+    }
+  });
+});
+
+document.getElementById('saveAllCSV').addEventListener('click', ()=>{
+  downloadAllCSV();
+});
+
+document.getElementById('syncAll').addEventListener('click', async ()=>{
+  const tables = qsAll('table[id^="table_"]');
+  document.getElementById('globalStatus').innerText = 'Syncing all...';
+  const overall = [];
+  for (const t of tables){
+    const r = await syncTableToSharePoint(t);
+    overall.push({ table: t.id, result: r });
+  }
+  document.getElementById('globalStatus').innerText = 'All sync done. See console for details.';
+  console.log('syncAll results', overall);
+});
+
+// Auto-make demo table editable on load
+document.addEventListener('DOMContentLoaded', ()=>{
+  qsAll('table[id^="table_"]').forEach(t => makeEditableForTable(t));
+});
+</script>
+
+</body>
+</html>
